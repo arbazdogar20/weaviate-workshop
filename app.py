@@ -1,61 +1,62 @@
 import streamlit as st
-from pymongo import MongoClient
+from sentence_transformers import SentenceTransformer
+from weaviate.auth import AuthApiKey
+from weaviate import connect_to_wcs
 import config
 
-# MongoDB connection
-client = MongoClient(config.MONGO_URI)
-db = client["search-enginee"]
-collection = db["movies"]
+WEAVIATE_URL = config.WEAVIATE_URL
+WEAVIATE_API_KEY = config.WEAVIATE_API_KEY
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
-# Streamlit app setup
-st.set_page_config(page_title="🎬 Movie Finder", page_icon="🎥", layout="wide")
-st.title("🎬 Movie Finder")
-st.write("Search for any movie by its name and view full details with poster, ratings, and more.")
+# --- Connect to Weaviate ---
+@st.cache_resource
+def connect_weaviate():
+    return connect_to_wcs(
+        cluster_url=WEAVIATE_URL,
+        auth_credentials=AuthApiKey(WEAVIATE_API_KEY),
+        skip_init_checks=True
+    )
 
-# Search bar
-query = st.text_input("🔍 Enter movie title")
+# --- Load model once ---
+@st.cache_resource
+def load_model():
+    return SentenceTransformer(EMBEDDING_MODEL)
 
+# --- UI Layout ---
+st.set_page_config("Movie Mind Reader", layout="wide")
+st.title("🧠🎬 Movie Mind Reader")
+st.caption("Discover movies by meaning, not just keywords!")
+
+query = st.text_input("What kind of movie are you looking for?", placeholder="e.g. mystery with a twist ending")
+top_k = st.slider("Number of results", 1, 15, 5)
+
+# --- Main logic ---
 if query:
-    # Build flexible query: match "Title" or "title"
-    results = list(collection.find({
-        "$or": [
-            {"Title": {"$regex": query, "$options": "i"}},
-            {"title": {"$regex": query, "$options": "i"}}
-        ]
-    }))
+    with st.spinner("Thinking..."):
+        try:
+            client = connect_weaviate()
+            model = load_model()
+            collection = client.collections.get("Movie")
 
-    if not results:
-        st.warning("❌ No movie found with that name.")
-    else:
-        for movie in results:
-            st.markdown("----")
-            cols = st.columns([1, 2])
+            vector = model.encode(query).tolist()
 
-            # Fallbacks: handle missing keys safely
-            poster = movie.get("Poster") or movie.get("poster") or ""
-            title = movie.get("Title") or movie.get("title") or "N/A"
-            year = movie.get("Year") or movie.get("year") or "N/A"
-            genre = movie.get("Genre") or movie.get("genre") or "N/A"
-            director = movie.get("Director") or movie.get("director") or "N/A"
-            runtime = movie.get("Runtime") or movie.get("runtime") or "N/A"
-            imdb_rating = movie.get("imdbRating") or movie.get("imdb_rating") or "N/A"
-            votes = movie.get("imdbVotes") or movie.get("imdb_votes") or "N/A"
-            awards = movie.get("Awards") or movie.get("awards") or "N/A"
-            box_office = movie.get("BoxOffice") or movie.get("box_office") or "N/A"
-            plot = movie.get("Plot") or movie.get("plot") or "N/A"
+            results = collection.query.near_vector(
+                near_vector=vector,
+                limit=top_k,
+                return_properties=["title", "plot", "genres", "year"],
+                return_metadata=["distance"]
+            )
 
-            with cols[0]:
-                if poster:
-                    st.image(poster, width=200)
-                else:
-                    st.info("No poster available.")
-            with cols[1]:
-                st.markdown(f"### 🎞️ {title} ({year})")
-                st.markdown(f"**🎭 Genre:** {genre}")
-                st.markdown(f"**🎬 Director:** {director}")
-                st.markdown(f"**🕒 Runtime:** {runtime}")
-                st.markdown(f"**⭐ IMDb Rating:** {imdb_rating}")
-                st.markdown(f"**🗳️ Votes:** {votes}")
-                st.markdown(f"**🏆 Awards:** {awards}")
-                st.markdown(f"**📦 Box Office:** {box_office}")
-                st.markdown(f"**📖 Plot:** {plot}")
+            if not results.objects:
+                st.warning("No results found. Try a broader query.")
+            else:
+                for obj in results.objects:
+                    props = obj.properties
+                    st.markdown(f"### 🎥 {props.get('title', 'Untitled')} ({props.get('year', 'N/A')})")
+                    st.write(f"**Genres:** {', '.join(props.get('genres', []))}")
+                    st.write(f"**Plot:** {props.get('plot', 'No plot available')}")
+                    st.write(f"**Similarity Score:** `{obj.metadata.distance:.4f}`")
+                    st.markdown("---")
+
+        except Exception as e:
+            st.error(f"Something went wrong: {e}")

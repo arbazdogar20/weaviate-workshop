@@ -1,51 +1,58 @@
-from pymongo import MongoClient
+import json
+from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
-import weaviate
+from weaviate import connect_to_wcs
+from weaviate.auth import AuthApiKey
 import config
 
-# 1️⃣ MongoDB
-mongo_client = MongoClient(config.MONGO_URI)
-db = mongo_client[config.MONGO_DB]
-collection = db[config.MONGO_COLLECTION]
+# Load JSON
+with open("sample_mflix.movies.json", "r") as f:
+    movies_data = json.load(f)
 
-# 2️⃣ Weaviate v3 style (matches your installed lib)
-client = weaviate.Client(
-    url=config.WEAVIATE_URL,  # FULL https:// URL
-    auth_client_secret=weaviate.AuthApiKey(config.WEAVIATE_API_KEY)
+# Connect to Weaviate
+client = connect_to_wcs(
+    cluster_url=config.WEAVIATE_URL,
+    auth_credentials=AuthApiKey(config.WEAVIATE_API_KEY),
+    skip_init_checks=True
 )
 
-# 3️⃣ Create schema if needed
-class_name = "Document"
+# Use smaller schema if in workshop mode
+schema = {
+    "class": "Movie",
+    "vectorizer": "none",
+    "properties": [
+        {"name": "title", "dataType": ["text"]},
+        {"name": "plot", "dataType": ["text"]},
+        {"name": "genres", "dataType": ["text[]"]},
+        {"name": "year", "dataType": ["number"]}
+    ]
+}
 
-if not client.schema.contains({"classes": [{"class": class_name}]}):
-    schema = {
-        "classes": [
-            {
-                "class": class_name,
-                "vectorizer": "none",
-                "properties": [
-                    {"name": "text", "dataType": ["text"]}
-                ],
-            }
-        ]
-    }
-    client.schema.create(schema)
+# Recreate schema (dev only!)
+if "Movie" in client.collections.list_all():
+    client.collections.delete("Movie")
+client.collections.create_from_dict(schema)
 
-# 4️⃣ Embed & insert
-model = SentenceTransformer('all-MiniLM-L6-v2')
+# Init embed model
+model = SentenceTransformer("all-MiniLM-L6-v2")
+collection = client.collections.get("Movie")
 
-for doc in collection.find():
-    text = doc.get("text_field")  # Replace with your field!
-    if not text:
-        continue
+# Import
+for movie in tqdm(movies_data[:1000], desc="Importing"):
+    try:
+        text = f"{movie['title']}: {movie.get('plot', '')}"
+        embedding = model.encode(text).tolist()
+        collection.data.insert(
+            properties={
+                "title": movie["title"],
+                "plot": movie.get("plot", ""),
+                "genres": movie.get("genres", []),
+                "year": movie.get("year", 0)
+            },
+            vector=embedding
+        )
+    except Exception as e:
+        print(f"Error: {movie.get('title')} – {e}")
 
-    embedding = model.encode(text).tolist()
-
-    client.data_object.create(
-        data_object={"text": text},
-        class_name=class_name,
-        vector=embedding
-    )
-
-mongo_client.close()
-print("✅ Import done using v3 syntax.")
+print("✅ Data import complete!")
+client.close()
